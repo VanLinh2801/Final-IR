@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 
 
 load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_EMBEDDING_MODEL_PATH = PROJECT_ROOT / "models" / "vietnamese-sbert"
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,13 @@ def _get_required(name: str) -> str:
     return value
 
 
+def _resolve_project_path(value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return (PROJECT_ROOT / path).resolve()
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     chunk_size = int(os.getenv("CHUNK_SIZE", "800"))
@@ -48,10 +57,10 @@ def get_settings() -> Settings:
 
     return Settings(
         student_id=_get_required("STUDENT_ID"),
-        embedding_model_path=Path(
+        embedding_model_path=_resolve_project_path(
             os.getenv(
                 "EMBEDDING_MODEL_PATH",
-                r"C:\Users\ADMIN\models\vietnamese-sbert",
+                str(DEFAULT_EMBEDDING_MODEL_PATH.relative_to(PROJECT_ROOT)),
             )
         ),
         teacher_base_url=os.getenv(
