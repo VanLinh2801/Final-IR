@@ -10,6 +10,9 @@ from app.config import Settings
 
 LOGGER = logging.getLogger(__name__)
 ANSWER_PATTERN = re.compile(r"\b([ABCD])\b", re.IGNORECASE)
+OPTION_PATTERN = re.compile(
+    r"(?ims)(?:^|\n)\s*([ABCD])[\.\):\-]\s*(.+?)(?=(?:\n\s*[ABCD][\.\):\-]\s)|\Z)"
+)
 
 
 class TeacherProxyTimeoutError(RuntimeError):
@@ -33,13 +36,7 @@ class LlmService:
         context = "\n\n".join(
             f"[Chunk {index + 1}]\n{chunk}" for index, chunk in enumerate(context_chunks)
         )
-        prompt = (
-            "Bạn là trợ lý làm bài trắc nghiệm dựa trên tài liệu được cung cấp.\n"
-            "Chỉ chọn đúng một đáp án A, B, C hoặc D.\n"
-            "Không giải thích, không thêm từ nào khác ngoài một ký tự duy nhất.\n\n"
-            f"Tài liệu tham chiếu:\n{context}\n\n"
-            f"Câu hỏi:\n{question}"
-        )
+        prompt = self._build_prompt(question, context)
 
         try:
             response = self._client.chat.completions.create(
@@ -48,8 +45,9 @@ class LlmService:
                     {
                         "role": "system",
                         "content": (
-                            "Chỉ trả về đúng một ký tự A, B, C hoặc D. "
-                            "Không thêm dấu câu hay giải thích."
+                            "Answer Vietnamese legal multiple-choice questions using only the "
+                            "provided legal text. Identify the best legal basis internally, then "
+                            "return exactly one uppercase letter: A, B, C, or D."
                         ),
                     },
                     {"role": "user", "content": prompt},
@@ -68,6 +66,47 @@ class LlmService:
         if answer is None:
             raise RuntimeError(f"Could not parse answer from model output: {content!r}")
         return answer
+
+    @staticmethod
+    def _build_prompt(question: str, context: str) -> str:
+        options = LlmService._extract_options(question)
+        if options:
+            formatted_options = "\n".join(
+                f"{label}. {content}" for label, content in options.items()
+            )
+            return (
+                "Use the legal text below to answer the multiple-choice question.\n"
+                "Prefer the option that is most directly supported by the legal text.\n"
+                "If two options are similar, choose the one with the strongest explicit basis.\n"
+                "Return only one letter: A, B, C, or D.\n\n"
+                f"Legal text:\n{context}\n\n"
+                f"Question:\n{LlmService._strip_options(question)}\n\n"
+                f"Options:\n{formatted_options}"
+            )
+
+        return (
+            "Use the legal text below to answer the Vietnamese multiple-choice question.\n"
+            "Return only one letter: A, B, C, or D.\n\n"
+            f"Legal text:\n{context}\n\n"
+            f"Question:\n{question}"
+        )
+
+    @staticmethod
+    def _extract_options(question: str) -> dict[str, str]:
+        options = {
+            label.upper(): " ".join(content.split())
+            for label, content in OPTION_PATTERN.findall(question)
+        }
+        if {"A", "B", "C", "D"}.issubset(options):
+            return options
+        return {}
+
+    @staticmethod
+    def _strip_options(question: str) -> str:
+        match = OPTION_PATTERN.search(question)
+        if not match:
+            return question.strip()
+        return question[: match.start()].strip()
 
     @staticmethod
     def _normalize_answer(raw_text: str) -> str | None:
