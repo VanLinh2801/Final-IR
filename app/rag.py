@@ -13,7 +13,7 @@ from hashlib import sha256
 from threading import Lock
 
 import numpy as np
-from sentence_transformers import CrossEncoder, SentenceTransformer
+from sentence_transformers import SentenceTransformer
 
 from app.config import Settings
 from app.text_utils import strip_options
@@ -441,27 +441,7 @@ class RagService:
         self._lexical_index = LexicalIndex(token_counts=[], idf={}, average_length=0.0)
         self._index_persisted = False
         LOGGER.info("Embedding model loaded from %s", settings.embedding_model_path)
-        self._reranker = self._load_reranker()
         self._load_persisted_index()
-
-    def _load_reranker(self) -> CrossEncoder | None:
-        if not self._settings.reranker_enabled:
-            return None
-        try:
-            reranker = CrossEncoder(
-                self._settings.reranker_model_path,
-                max_length=self._settings.reranker_max_length,
-            )
-            LOGGER.info(
-                "Reranker loaded from %s", self._settings.reranker_model_path
-            )
-            return reranker
-        except Exception:
-            LOGGER.exception(
-                "Failed to load reranker %s; continuing with dense+bm25 scoring",
-                self._settings.reranker_model_path,
-            )
-            return None
 
     def ingest(self, text: str, doc_id: str | None) -> tuple[str | None, int]:
         chunks = _chunk_text(
@@ -548,19 +528,6 @@ class RagService:
                 + _exact_phrase_bonus(question_tokens, chunk)
             )
             reranked.append((final_score, index))
-
-        if self._reranker is not None:
-            try:
-                pairs = [[clean_query, chunks[index]] for index in candidate_indices_list]
-                scores = self._reranker.predict(pairs, show_progress_bar=False)
-                reranked = [
-                    (float(score), int(index))
-                    for score, index in zip(scores, candidate_indices_list)
-                ]
-            except Exception:
-                LOGGER.exception(
-                    "Reranker prediction failed; using dense+bm25 scores"
-                )
 
         reranked.sort(key=lambda item: item[0], reverse=True)
         core_indices, core_scores = _select_mmr(

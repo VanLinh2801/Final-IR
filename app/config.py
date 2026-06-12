@@ -32,9 +32,6 @@ class Settings:
     mmr_lambda: float
     dedup_threshold: float
     neighbor_radius: int
-    reranker_enabled: bool
-    reranker_model_path: str
-    reranker_max_length: int
 
     @property
     def server_url(self) -> str:
@@ -54,6 +51,20 @@ def _resolve_project_path(value: str) -> Path:
     if path.is_absolute():
         return path
     return (PROJECT_ROOT / path).resolve()
+
+
+def _float_or_default(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip().lower() == "auto":
+        return default
+    return float(raw)
+
+
+def _int_or_default(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip().lower() == "auto":
+        return default
+    return int(raw)
 
 
 @lru_cache(maxsize=1)
@@ -87,13 +98,9 @@ def get_settings() -> Settings:
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         llm_model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
-        llm_timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "45")),
+        llm_timeout_seconds=_float_or_default("LLM_TIMEOUT_SECONDS", 45.0),
         evaluate_timeout_seconds=float(os.getenv("EVALUATE_TIMEOUT_SECONDS", "7200")),
-        mmr_lambda=float(os.getenv("MMR_LAMBDA", "0.7")),
+        mmr_lambda=_float_or_default("MMR_LAMBDA", 0.7),
         dedup_threshold=float(os.getenv("DEDUP_THRESHOLD", "0.97")),
-        neighbor_radius=int(os.getenv("NEIGHBOR_RADIUS", "1")),
-        reranker_enabled=os.getenv("RERANKER_ENABLED", "false").strip().lower()
-        in {"1", "true", "yes", "on"},
-        reranker_model_path=os.getenv("RERANKER_MODEL_PATH", "itdainb/PhoRanker"),
-        reranker_max_length=int(os.getenv("RERANKER_MAX_LENGTH", "256")),
+        neighbor_radius=_int_or_default("NEIGHBOR_RADIUS", 1),
     )
