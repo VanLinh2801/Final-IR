@@ -20,7 +20,7 @@ from app.text_utils import strip_options
 
 
 LOGGER = logging.getLogger(__name__)
-RETRIEVAL_VERSION = 3
+RETRIEVAL_VERSION = 4
 TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
 REFERENCE_PATTERN = re.compile(
     r"\b(?:điều|dieu|khoản|khoan|mục|muc|"
@@ -37,6 +37,7 @@ LEGAL_HEADING_PATTERN = re.compile(
     re.IGNORECASE,
 )
 BULLET_PATTERN = re.compile(r"^(?:[-+*•]|\(?[a-zA-Z]\)|[a-zA-Z][\.\)])\s+\S+")
+SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.!?;])\s+|\n+")
 STOPWORDS = {
     "a",
     "an",
@@ -202,46 +203,200 @@ def _segment_text(normalized_text: str) -> list[str]:
     return segments or [normalized_text]
 
 
-def _chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
+def _token_len(tokenizer, text: str) -> int:
+    stripped = text.strip()
+    if not stripped:
+        return 0
+    return len(tokenizer(stripped, add_special_tokens=False)["input_ids"])
+
+
+def _split_into_sentences(text: str) -> list[str]:
+    parts = SENTENCE_SPLIT_PATTERN.split(text.strip())
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _join_text_parts(parts: list[str]) -> str:
+    if any("\n" in part for part in parts):
+        return "\n".join(parts)
+    return " ".join(parts)
+
+
+def _overlap_tail_tokens(parts: list[str], tokenizer, overlap_tokens: int) -> list[str]:
+    if overlap_tokens <= 0 or not parts:
+        return []
+
+    collected: list[str] = []
+    for part in reversed(parts):
+        collected.insert(0, part)
+        if _token_len(tokenizer, _join_text_parts(collected)) > overlap_tokens:
+            collected.pop(0)
+            break
+    return collected or [parts[-1]]
+
+
+def _split_by_words(
+    text: str,
+    tokenizer,
+    max_tokens: int,
+    overlap_tokens: int,
+) -> list[str]:
+    words = text.split()
+    if not words:
+        return []
+
+    chunks: list[str] = []
+    current_words: list[str] = []
+
+    def flush_current() -> None:
+        nonlocal current_words
+        if current_words:
+            chunks.append(" ".join(current_words))
+            current_words = []
+
+    for word in words:
+        candidate = " ".join(current_words + [word]) if current_words else word
+        if current_words and _token_len(tokenizer, candidate) > max_tokens:
+            flush_current()
+            if _token_len(tokenizer, word) > max_tokens:
+                chunks.append(word)
+                continue
+            if chunks and overlap_tokens > 0:
+                previous_words = chunks[-1].split()
+                overlap_words: list[str] = []
+                for previous_word in reversed(previous_words):
+                    overlap_candidate = " ".join(reversed(overlap_words) + [previous_word])
+                    if overlap_words and _token_len(tokenizer, overlap_candidate) > overlap_tokens:
+                        break
+                    overlap_words.insert(0, previous_word)
+                current_words = overlap_words
+            current_words.append(word)
+            continue
+        current_words.append(word)
+
+    flush_current()
+    return chunks
+
+
+def _split_by_tokens(
+    text: str,
+    tokenizer,
+    max_tokens: int,
+    overlap_tokens: int,
+) -> list[str]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    if _token_len(tokenizer, stripped) <= max_tokens:
+        return [stripped]
+
+    sentences = _split_into_sentences(stripped)
+    if len(sentences) == 1:
+        return _split_by_words(stripped, tokenizer, max_tokens, overlap_tokens)
+
+    chunks: list[str] = []
+    current_parts: list[str] = []
+
+    def flush_with_overlap() -> None:
+        nonlocal current_parts
+        if not current_parts:
+            return
+        chunks.append(_join_text_parts(current_parts))
+        if overlap_tokens > 0:
+            current_parts = _overlap_tail_tokens(current_parts, tokenizer, overlap_tokens)
+        else:
+            current_parts = []
+
+    for sentence in sentences:
+        if _token_len(tokenizer, sentence) > max_tokens:
+            if current_parts:
+                chunks.append(_join_text_parts(current_parts))
+                current_parts = []
+            chunks.extend(_split_by_words(sentence, tokenizer, max_tokens, overlap_tokens))
+            continue
+
+        projected_parts = current_parts + [sentence]
+        projected_text = _join_text_parts(projected_parts)
+        if current_parts and _token_len(tokenizer, projected_text) > max_tokens:
+            flush_with_overlap()
+            current_parts.append(sentence)
+            continue
+
+        current_parts.append(sentence)
+
+    if current_parts:
+        chunks.append(_join_text_parts(current_parts))
+
+    return chunks
+
+
+def _apply_token_guard(
+    chunks: list[str],
+    tokenizer,
+    max_tokens: int,
+    overlap_tokens: int,
+) -> list[str]:
+    guarded: list[str] = []
+    for chunk in chunks:
+        stripped = chunk.strip()
+        if not stripped:
+            continue
+        if _token_len(tokenizer, stripped) <= max_tokens:
+            guarded.append(stripped)
+        else:
+            guarded.extend(_split_by_tokens(stripped, tokenizer, max_tokens, overlap_tokens))
+    return guarded
+
+
+def _chunk_text(
+    text: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    *,
+    tokenizer,
+    max_chunk_tokens: int,
+) -> list[str]:
     normalized = _normalize_text(text)
     if not normalized:
         return []
 
+    overlap_tokens = max(16, max_chunk_tokens // 8)
     segments = _segment_text(normalized)
     if len(segments) == 1 and len(segments[0]) <= chunk_size:
-        return segments
+        chunks = segments
+    else:
+        chunks = []
+        current_segments: list[str] = []
+        current_length = 0
 
-    chunks: list[str] = []
-    current_segments: list[str] = []
-    current_length = 0
+        for segment in segments:
+            if len(segment) > chunk_size:
+                if current_segments:
+                    chunks.append("\n".join(current_segments))
+                    current_segments = []
+                    current_length = 0
+                chunks.extend(_split_long_segment(segment, chunk_size, chunk_overlap))
+                continue
 
-    for segment in segments:
-        if len(segment) > chunk_size:
-            if current_segments:
-                chunks.append("\n".join(current_segments))
-                current_segments = []
-                current_length = 0
-            chunks.extend(_split_long_segment(segment, chunk_size, chunk_overlap))
-            continue
-
-        projected_length = current_length + len(segment) + (1 if current_segments else 0)
-        if current_segments and projected_length > chunk_size:
-            flushed = "\n".join(current_segments)
-            chunks.append(flushed)
-            tail = _overlap_tail(flushed, chunk_overlap)
-            current_segments = [tail, segment] if tail else [segment]
-            current_length = sum(len(part) for part in current_segments) + max(
-                0, len(current_segments) - 1
+            projected_length = current_length + len(segment) + (
+                1 if current_segments else 0
             )
-            continue
+            if current_segments and projected_length > chunk_size:
+                flushed = "\n".join(current_segments)
+                chunks.append(flushed)
+                tail = _overlap_tail(flushed, chunk_overlap)
+                current_segments = [tail, segment] if tail else [segment]
+                current_length = sum(len(part) for part in current_segments) + max(
+                    0, len(current_segments) - 1
+                )
+                continue
 
-        current_segments.append(segment)
-        current_length = projected_length
+            current_segments.append(segment)
+            current_length = projected_length
 
-    if current_segments:
-        chunks.append("\n".join(current_segments))
+        if current_segments:
+            chunks.append("\n".join(current_segments))
 
-    return chunks
+    return _apply_token_guard(chunks, tokenizer, max_chunk_tokens, overlap_tokens)
 
 
 def _tokenize_to_list(text: str) -> list[str]:
@@ -428,8 +583,8 @@ class RagService:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._model = SentenceTransformer(
-            str(settings.embedding_model_path),
-            local_files_only=True,
+            settings.embedding_model_source,
+            local_files_only=settings.embedding_model_local_only,
         )
         self._index_dir = settings.index_storage_dir
         self._metadata_path = self._index_dir / "metadata.json"
@@ -440,7 +595,11 @@ class RagService:
         self._embeddings: np.ndarray | None = None
         self._lexical_index = LexicalIndex(token_counts=[], idf={}, average_length=0.0)
         self._index_persisted = False
-        LOGGER.info("Embedding model loaded from %s", settings.embedding_model_path)
+        LOGGER.info(
+            "Embedding model loaded from %s (local_only=%s)",
+            settings.embedding_model_source,
+            settings.embedding_model_local_only,
+        )
         self._load_persisted_index()
 
     def ingest(self, text: str, doc_id: str | None) -> tuple[str | None, int]:
@@ -448,6 +607,8 @@ class RagService:
             text,
             chunk_size=self._settings.chunk_size,
             chunk_overlap=self._settings.chunk_overlap,
+            tokenizer=self._model.tokenizer,
+            max_chunk_tokens=self._settings.max_chunk_tokens,
         )
         if not chunks:
             raise ValueError("Document did not produce any chunks")
@@ -584,9 +745,10 @@ class RagService:
         metadata = {
             "doc_id": doc_id,
             "chunks": chunks,
-            "embedding_model_path": str(self._settings.embedding_model_path),
+            "embedding_model_path": self._settings.embedding_model_source,
             "chunk_size": self._settings.chunk_size,
             "chunk_overlap": self._settings.chunk_overlap,
+            "max_chunk_tokens": self._settings.max_chunk_tokens,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "text_hash": sha256(text.encode("utf-8")).hexdigest(),
             "retrieval_version": RETRIEVAL_VERSION,
@@ -651,12 +813,14 @@ class RagService:
         if missing_keys:
             raise ValueError(f"Persisted metadata missing keys: {sorted(missing_keys)}")
 
-        if metadata["embedding_model_path"] != str(self._settings.embedding_model_path):
+        if metadata["embedding_model_path"] != self._settings.embedding_model_source:
             raise ValueError("Persisted index embedding model does not match current config")
         if int(metadata["chunk_size"]) != self._settings.chunk_size:
             raise ValueError("Persisted index chunk_size does not match current config")
         if int(metadata["chunk_overlap"]) != self._settings.chunk_overlap:
             raise ValueError("Persisted index chunk_overlap does not match current config")
+        if int(metadata.get("max_chunk_tokens", 0)) != self._settings.max_chunk_tokens:
+            raise ValueError("Persisted index max_chunk_tokens does not match current config")
         if not isinstance(metadata["chunks"], list) or not all(
             isinstance(chunk, str) for chunk in metadata["chunks"]
         ):
