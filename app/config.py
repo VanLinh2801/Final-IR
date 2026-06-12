@@ -17,6 +17,7 @@ DEFAULT_EMBEDDING_MODEL_PATH = PROJECT_ROOT / "models" / "vietnamese-sbert"
 class Settings:
     student_id: str
     embedding_model_path: Path
+    index_storage_dir: Path
     teacher_base_url: str
     teacher_proxy_base_url: str
     server_host: str
@@ -27,6 +28,13 @@ class Settings:
     chunk_overlap: int
     llm_model: str
     llm_timeout_seconds: float
+    evaluate_timeout_seconds: float
+    mmr_lambda: float
+    dedup_threshold: float
+    neighbor_radius: int
+    reranker_enabled: bool
+    reranker_model_path: str
+    reranker_max_length: int
 
     @property
     def server_url(self) -> str:
@@ -63,6 +71,9 @@ def get_settings() -> Settings:
                 str(DEFAULT_EMBEDDING_MODEL_PATH.relative_to(PROJECT_ROOT)),
             )
         ),
+        index_storage_dir=_resolve_project_path(
+            os.getenv("INDEX_STORAGE_DIR", "storage/index")
+        ),
         teacher_base_url=os.getenv(
             "TEACHER_BASE_URL", "http://192.168.50.218:8000/api/v1"
         ).rstrip("/"),
@@ -76,5 +87,13 @@ def get_settings() -> Settings:
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         llm_model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
-        llm_timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "30")),
+        llm_timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "45")),
+        evaluate_timeout_seconds=float(os.getenv("EVALUATE_TIMEOUT_SECONDS", "7200")),
+        mmr_lambda=float(os.getenv("MMR_LAMBDA", "0.7")),
+        dedup_threshold=float(os.getenv("DEDUP_THRESHOLD", "0.97")),
+        neighbor_radius=int(os.getenv("NEIGHBOR_RADIUS", "1")),
+        reranker_enabled=os.getenv("RERANKER_ENABLED", "false").strip().lower()
+        in {"1", "true", "yes", "on"},
+        reranker_model_path=os.getenv("RERANKER_MODEL_PATH", "itdainb/PhoRanker"),
+        reranker_max_length=int(os.getenv("RERANKER_MAX_LENGTH", "256")),
     )

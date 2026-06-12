@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
 from app.config import Settings
+from app.text_utils import extract_options, strip_options
 
 
 LOGGER = logging.getLogger(__name__)
 ANSWER_PATTERN = re.compile(r"\b([ABCD])\b", re.IGNORECASE)
-OPTION_PATTERN = re.compile(
-    r"(?ims)(?:^|\n)\s*([ABCD])[\.\):\-]\s*(.+?)(?=(?:\n\s*[ABCD][\.\):\-]\s)|\Z)"
-)
+MAX_CONTEXT_CHARS = 8000
 
 
 class TeacherProxyTimeoutError(RuntimeError):
@@ -33,9 +33,12 @@ class LlmService:
         )
 
     def answer_question(self, question: str, context_chunks: list[str]) -> str:
+        started_at = time.perf_counter()
         context = "\n\n".join(
             f"[Chunk {index + 1}]\n{chunk}" for index, chunk in enumerate(context_chunks)
         )
+        if len(context) > MAX_CONTEXT_CHARS:
+            context = context[:MAX_CONTEXT_CHARS].rsplit("\n", 1)[0].strip()
         prompt = self._build_prompt(question, context)
 
         try:
@@ -65,11 +68,16 @@ class LlmService:
         answer = self._normalize_answer(content)
         if answer is None:
             raise RuntimeError(f"Could not parse answer from model output: {content!r}")
+        LOGGER.info(
+            "Teacher proxy returned answer=%s in %.3fs",
+            answer,
+            time.perf_counter() - started_at,
+        )
         return answer
 
     @staticmethod
     def _build_prompt(question: str, context: str) -> str:
-        options = LlmService._extract_options(question)
+        options = extract_options(question)
         if options:
             formatted_options = "\n".join(
                 f"{label}. {content}" for label, content in options.items()
@@ -80,7 +88,7 @@ class LlmService:
                 "If two options are similar, choose the one with the strongest explicit basis.\n"
                 "Return only one letter: A, B, C, or D.\n\n"
                 f"Legal text:\n{context}\n\n"
-                f"Question:\n{LlmService._strip_options(question)}\n\n"
+                f"Question:\n{strip_options(question)}\n\n"
                 f"Options:\n{formatted_options}"
             )
 
@@ -90,23 +98,6 @@ class LlmService:
             f"Legal text:\n{context}\n\n"
             f"Question:\n{question}"
         )
-
-    @staticmethod
-    def _extract_options(question: str) -> dict[str, str]:
-        options = {
-            label.upper(): " ".join(content.split())
-            for label, content in OPTION_PATTERN.findall(question)
-        }
-        if {"A", "B", "C", "D"}.issubset(options):
-            return options
-        return {}
-
-    @staticmethod
-    def _strip_options(question: str) -> str:
-        match = OPTION_PATTERN.search(question)
-        if not match:
-            return question.strip()
-        return question[: match.start()].strip()
 
     @staticmethod
     def _normalize_answer(raw_text: str) -> str | None:
